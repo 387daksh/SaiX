@@ -1,0 +1,15 @@
+video: data/videos/dashcam.mp4
+sampling_fps: 5
+measurement_distance_m: 15.0
+models:
+  yolop_lane_threshold: 0.35
+  yolop_drive_threshold: 0.50
+  vda_encoder: vits
+  vda_metric: true
+  vda_input_size: 518
+  vda_max_res: 960
+geometry:
+  min_lane_width_m: 1.5
+  max_lane_width_m: 6.0
+temporal:
+  median_window: 5

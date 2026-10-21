@@ -1,0 +1,8 @@
+# Install into the existing YOLOP environment. Do not reinstall torch here.
+prefetch_generator
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+PyYAML>=6.0
+scipy>=1.10
+tqdm>=4.65

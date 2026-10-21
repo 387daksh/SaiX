@@ -1,0 +1,10 @@
+{
+  "image_width": 1920,
+  "image_height": 1080,
+  "fx": 1000.0,
+  "fy": 1000.0,
+  "cx": 960.0,
+  "cy": 540.0,
+  "distortion": [0, 0, 0, 0, 0],
+  "note": "PLACEHOLDER. Replace fx/fy/distortion with a real calibration before trusting metric measurements."
+}

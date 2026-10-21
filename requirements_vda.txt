@@ -1,0 +1,2 @@
+# The official VDA repository has its own pinned requirements.
+# Use scripts/setup_vda.ps1 instead of installing this file manually.

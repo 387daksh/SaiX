@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv*/
+third_party/
+data/videos/*
+data/sequence/*
+data/outputs/*
+!data/outputs/.gitkeep
+models/checkpoints/*
+calibration/homography.json
