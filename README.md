@@ -130,6 +130,126 @@ under-confident here: its native `conf=0.4` returns nothing, so the default is
 `0.15` with `max_lanes=8`. It is also fed an aspect-matched horizon-to-bottom
 band rather than a squashed full frame.
 
+### JSON output for dashboards
+
+Every run writes `clip<part>_<detector>.jsonl` next to the CSV — one JSON object
+per frame, newline-delimited. A full-length run is ~200k frames, which is why
+this is JSON Lines rather than one array: a dashboard can tail it, stream it, or
+read a slice without parsing the whole clip.
+
+```json
+{
+  "frame": 36105,
+  "time_s": 1203.5,
+  "lane_width_m": 3.2104,
+  "lane_width_m_smooth": 3.1262,
+  "marking_missing": "right",
+  "vehicles": [
+    {
+      "track_id": 3450,
+      "box": [425, 484, 501, 563],
+      "width_px": 75,
+      "width_m": 0.6828,
+      "distance_m": 28.8,
+      "offset_m": 3.66,
+      "width_reliable": true,
+      "cls": "motorcycle",
+      "score": 0.446,
+      "plate": "M197EA",
+      "plate_conf": 0.999,
+      "is_lead": false
+    }
+  ]
+}
+```
+
+- `track_id` is stable across frames for the same vehicle, or `null` on the
+  frames before the tracker has confirmed a box.
+- `box` is `[x1, y1, x2, y2]` in pixels on the source frame.
+- `width_px` is the box width; `width_m` is that box's bottom edge projected
+  onto the road plane, so it carries the same scale caveat as lane width.
+- `distance_m` / `offset_m` are the vehicle's footprint centre in road-plane
+  coordinates: forward distance and lateral offset from the camera.
+- `width_reliable` says whether this detection falls in the band where a
+  box-bottom width means anything — see **Vehicle widths** below.
+- `plate` / `plate_conf` are the plate read on this frame, or `null`. The
+  per-frame read is raw; the voted result is in the vehicles CSV.
+- `is_lead` marks the nearest vehicle inside the ego lane. At most one vehicle
+  per frame has it, and a frame may have none.
+- `lane_width_m`, `lane_width_m_smooth` and `marking_missing` are `null` rather
+  than omitted when there is no measurement for that frame.
+
+On a stretch with no lane markings there is no vanishing point and so no road
+plane. Detection still runs: `width_m`, `distance_m` and `offset_m` come back
+`null` while `box`, `cls`, `track_id` and `plate` are populated as usual.
+
+To collapse it into a single array for a dashboard that wants one document:
+
+```bash
+python -c "import json,sys;print(json.dumps([json.loads(l) for l in sys.stdin]))" \
+  < data/outputs/lane_width/clip0_laneseg.jsonl > frames.json
+```
+
+All vehicles are reported, not just the lead. The annotated video draws every
+detection: the lead vehicle in blue, the rest in orange, each labelled with its
+pixel and metric width. The CSV keeps its single-lead columns for backward
+compatibility and gains an `n_vehicles` count.
+
+### One row per vehicle
+
+Every run also writes `clip<part>_<detector>_vehicles.csv`: one row per tracked
+vehicle rather than per frame, which is what you want when the question is
+"which vehicles went past and how wide were they" rather than "what happened on
+frame 36105".
+
+| column | meaning |
+| --- | --- |
+| `track_id`, `cls`, `n_frames` | identity, majority class, frames seen |
+| `first_frame` … `last_time_s` | when it entered and left |
+| `plate`, `plate_conf`, `plate_votes` | the voted plate, blank unless it clears the gate |
+| `plate_candidates` | the 8 strongest strings ever read, as `TEXT:votes` |
+| `width_px_median`, `width_px_max` | pixel width, always present |
+| `width_m_median`, `width_m_samples` | metric width from in-band detections only |
+| `width_m_median_all` | metric width from every detection, unfiltered |
+| `min_distance_m`, `frames_as_lead` | closest approach, frames spent as lead |
+| `merged_track_ids` | ids folded into this row by plate |
+
+Plates are voted across frames by summed confidence, not by count, so three
+blurred agreeing misreads do not outweigh one clean read. A string is only
+promoted to `plate` once it clears `--plate-min-conf` (0.85) and
+`--plate-min-votes` (2); everything else stays visible in `plate_candidates`.
+
+Two vehicles that are really one — the tracker dropped the id and started a new
+one — are rejoined when both carry the same confident plate, and the absorbed
+ids are listed in `merged_track_ids`. Tracks seen fewer than
+`--min-track-frames` (3) times with no plate are dropped as ID churn.
+
+### Vehicle widths
+
+Lane width is a measurement. Per-vehicle width is weaker, and the CSV says so
+with two separate columns.
+
+Width comes from projecting the box's bottom edge onto the road plane, which
+assumes that edge sits on the tyre contact line. That holds for a vehicle
+squarely ahead at moderate range and fails in two ways: too close or too far to
+the side, and the box spans the *side* of an obliquely seen vehicle rather than
+its front; too far away, and the box is so few pixels tall that a pixel of slop
+at the bottom swings the distance by metres.
+
+`width_m_median` therefore uses only detections inside a band — 8–40 m, within
+6 m laterally — and is blank when a vehicle never passed through it.
+`width_m_median_all` is the unfiltered median, always present.
+
+Measured on an hour of this footage: inside the band an in-lane car reads
+1.78 m against a true ~1.75; across all detections the same class reads 1.40 m.
+The band removes the catastrophic tail, not a residual low bias of roughly 9%.
+Note also that COCO's `truck` and `bus` classes collect tricycles, multicabs
+and jeepneys on Philippine roads, so a 1.5 m "truck" is usually a correct
+measurement of a narrow vehicle rather than an error.
+
+Every metric figure scales linearly with `--camera-height`. If that number is
+later measured properly, rescale rather than re-run.
+
 ### Reading the results
 
 `lane_width_m` / `lead_width_m` are raw per-frame; the `_smooth` columns are
@@ -219,6 +339,18 @@ Measured on the reference run above, at identical output — every frame, same
 |---|---|---|
 | single-threaded loop | 14.9 fps | 223 min |
 | threaded | 28.4–30.6 fps | 110 min |
+
+Those figures predate plate reading. With `--plate-mode crops` the ALPR models
+run per vehicle box, and a 66-minute 1080p clip measured 7.8 fps end to end
+(118,861 frames in 4 h 13 m) on an RTX 4050 Laptop. Pass `--no-plates` to get
+the older numbers back.
+
+That run was also CPU-bound rather than GPU-bound, for a reason worth checking
+before blaming hardware: the ALPR models were on the CPU because onnxruntime-gpu
+needs CUDA 12 and this machine had CUDA 13 (see `PlateReader`). GPU utilisation
+swung between 13% and 58% at 343 MiB of VRAM, so a larger card buys very little
+here — note that A100 and H100 have no NVENC at all, which makes them poor
+choices for a job whose output is an encoded video.
 
 ### Remaining headroom
 

@@ -25,6 +25,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lane_core as lc
+import lane_detectors as ld
 from lane_detectors import VehicleDetector, build_lane_detector
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -44,7 +45,8 @@ def clip_range(cap, part, clip_seconds):
     return start, min(total, part * n), fps, total
 
 
-def measure_frame(frame, lane_det, veh_det, state, args, abs_bounds=True):
+def measure_frame(frame, lane_det, veh_det, state, args, abs_bounds=True,
+                  plate_reader=None):
     """
     One frame: markings -> road plane -> ego lane -> lead vehicle.
 
@@ -55,8 +57,15 @@ def measure_frame(frame, lane_det, veh_det, state, args, abs_bounds=True):
 
     vp = state["vpf"].update(lc.vanishing_point(markings, w, h))
     if vp is None:
-        return {"lane": None, "lead": None, "gp": None, "left": None,
-                "right": None, "n_mark": len(markings)}
+        # No vanishing point means no ground plane, so nothing can be placed
+        # in metres. Detection still runs: plates and track identity need no
+        # geometry, and whole stretches of this footage have no painted
+        # markings at all. Returning early here cost every vehicle and every
+        # plate over 26 minutes of the source video.
+        vehicles, _ = _detect_vehicles(frame, veh_det, plate_reader,
+                                       None, None, None, None, args)
+        return {"lane": None, "lead": None, "vehicles": vehicles, "gp": None,
+                "left": None, "right": None, "n_mark": len(markings)}
 
     H = state["height"]
     gp = lc.GroundPlane(args.focal, w / 2.0, h / 2.0, vp[0], vp[1], H)
@@ -144,22 +153,50 @@ def measure_frame(frame, lane_det, veh_det, state, args, abs_bounds=True):
             state["lane_ref"] = float(np.median(hist))
             state["pitch"] = state["lane_ref"]
 
-    lead = None
-    if veh_det is not None:
-        boxes, cls, scores = veh_det(frame)
-        if len(boxes):
-            lead = lc.pick_lead(
-                lc.measure_vehicles(boxes, cls, scores, gp), left, right,
-                z_ref,
-            )
-            if lead is not None and not (
-                args.min_veh <= lead.width <= args.max_veh
-            ):
-                lead = None
+    vehicles, lead = _detect_vehicles(frame, veh_det, plate_reader, gp,
+                                      left, right, z_ref, args)
 
-    return {"lane": lane, "lead": lead, "gp": gp, "left": left,
-            "right": right, "n_mark": len(markings), "ego": ego,
+    return {"lane": lane, "lead": lead, "vehicles": vehicles, "gp": gp,
+            "left": left, "right": right, "n_mark": len(markings), "ego": ego,
             "pitch": state.get("pitch")}
+
+
+def _detect_vehicles(frame, veh_det, plate_reader, gp, left, right, z_ref,
+                     args):
+    """
+    Boxes, plates and the lead vehicle for one frame.
+
+    gp None means no ground plane: boxes and plates still come back, but
+    nothing is placed in metres and there is no lead vehicle to pick.
+    """
+    if veh_det is None:
+        return [], None
+    boxes, cls, scores, track_ids = veh_det(frame)
+    if not len(boxes):
+        return [], None
+
+    vehicles = lc.measure_vehicles(boxes, cls, scores, gp,
+                                   track_ids=track_ids)
+    if plate_reader is not None and vehicles:
+        # Plates are only legible close up, so skip the read entirely on
+        # frames whose vehicles are all far away. That is most of an open-road
+        # drive, and it costs nothing measurable. With no ground plane there
+        # is no distance to gate on, so every such frame is read.
+        zs = [v.Z for v in vehicles if v.Z is not None]
+        if not zs or min(zs) <= args.plate_z_max:
+            if args.plate_mode == "crops":
+                plates = plate_reader.read_crops(
+                    frame, vehicles, min_px=args.plate_min_px)
+            else:
+                plates = plate_reader(frame)
+            ld.attach_plates(vehicles, plates)
+
+    if gp is None:
+        return vehicles, None
+    lead = lc.pick_lead(vehicles, left, right, z_ref)
+    if lead is not None and not (args.min_veh <= lead.width <= args.max_veh):
+        lead = None
+    return vehicles, lead
 
 
 def _update_phase(state, ph, pitch, alpha=0.25):
@@ -214,7 +251,7 @@ def calibrate_from_vehicles(cap, start, end, lane_det, veh_det, state, args):
             continue
         gp = lc.GroundPlane(args.focal, w / 2.0, h / 2.0, vp[0], vp[1], 1.0)
 
-        boxes, cls, scores = veh_det(frame)
+        boxes, cls, scores, _ = veh_det(frame)
         for (x1, y1, x2, y2), c, s in zip(boxes, cls, scores):
             if int(c) != 2:                       # cars only
                 continue
@@ -308,6 +345,12 @@ def main():
     ap.add_argument("--part", type=int, default=5,
                     help="which clip to process (5 = last); 0 = whole video")
     ap.add_argument("--clip-seconds", type=float, default=300.0)
+    ap.add_argument("--min-track-frames", type=int, default=3,
+                    help="drop plate-less tracks seen fewer times than this; "
+                         "they are nearly all ID switches")
+    ap.add_argument("--start-frame", type=int, default=0,
+                    help="resume at this absolute frame instead of the part "
+                         "boundary; temporal state restarts here")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="debug: stop after N frames")
     ap.add_argument("--stride", type=int, default=1,
@@ -398,6 +441,44 @@ def main():
                     help="0 = 1.50 x expected lane width")
     ap.add_argument("--min-veh", type=float, default=0.5)
     ap.add_argument("--max-veh", type=float, default=4.0)
+    ap.add_argument("--no-plates", action="store_true",
+                    help="skip license plate detection and OCR")
+    ap.add_argument("--plate-z-max", type=float, default=25.0,
+                    help="skip the plate read on frames whose nearest vehicle "
+                         "is beyond this distance in metres; plates are not "
+                         "legible that far out at 1080p")
+    ap.add_argument("--plate-conf", type=float, default=0.4,
+                    help="plate detector confidence threshold")
+    ap.add_argument("--plate-mode", default="crops", choices=["crops", "frame"],
+                    help="crops runs the plate detector on each vehicle box at "
+                         "near-native resolution; frame runs it once on the "
+                         "whole image, which is faster but loses small plates")
+    ap.add_argument("--plate-min-conf", type=float, default=0.85,
+                    help="a plate is only reported in the plate column above "
+                         "this confidence; weaker reads stay in "
+                         "plate_candidates rather than being dropped")
+    ap.add_argument("--plate-min-votes", type=int, default=2,
+                    help="a plate must also be read this many times across "
+                         "the track; one low-confidence frame is noise")
+    ap.add_argument("--plate-min-px", type=int, default=100,
+                    help="crops mode: skip vehicle boxes narrower than this")
+    ap.add_argument("--plate-detector",
+                    default="yolo-v9-t-384-license-plate-end2end",
+                    help="fast-alpr plate detector model name")
+    ap.add_argument("--plate-ocr", default="cct-xs-v2-global-model",
+                    help="fast-alpr OCR model name")
+    ap.add_argument("--no-agnostic-nms", action="store_true",
+                    help="keep per-class NMS on the vehicle detector; the "
+                         "default merges boxes across classes so one vehicle "
+                         "cannot appear as both a car and a truck")
+    ap.add_argument("--tracker", default="bytetrack.yaml",
+                    choices=["bytetrack.yaml", "botsort.yaml"],
+                    help="ByteTrack is markedly faster; BoT-SORT adds global "
+                         "motion compensation, which costs more than it buys "
+                         "on a forward-facing dashcam")
+    ap.add_argument("--no-track", action="store_true",
+                    help="disable vehicle tracking; without it the grouped "
+                         "per-vehicle CSV cannot be written")
 
     ap.add_argument("--crf", type=int, default=23)
     ap.add_argument("--no-video", action="store_true")
@@ -412,6 +493,11 @@ def main():
     start, end, fps, total = clip_range(cap, args.part, args.clip_seconds)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if args.start_frame:
+        # Resuming a killed run. Temporal state (vanishing point, learned
+        # scale, smoothing) starts fresh here, so the first seconds after the
+        # join settle rather than carrying over.
+        start = args.start_frame
     if args.max_frames:
         end = min(end, start + args.max_frames)
 
@@ -426,7 +512,15 @@ def main():
     veh_det = None
     if not args.no_vehicle:
         veh_det = VehicleDetector(args.vehicle_weights, args.device,
-                                  conf=args.veh_conf)
+                                  conf=args.veh_conf,
+                                  track=not args.no_track,
+                                  tracker=args.tracker,
+                                  agnostic_nms=not args.no_agnostic_nms)
+    plate_reader = None
+    if not args.no_plates and not args.no_vehicle:
+        plate_reader = ld.PlateReader(detector=args.plate_detector,
+                                      ocr=args.plate_ocr,
+                                      conf=args.plate_conf, device=args.device)
 
     # Plausibility window scaled to the lane width we expect, so it tracks the
     # calibrated scale instead of assuming one.
@@ -466,8 +560,17 @@ def main():
         "marking_missing", "ego_left_present", "ego_right_present",
         "slots_total", "slots_missing",
         "conf_left", "conf_middle", "conf_right",
-        "width_left_m", "width_middle_m", "width_right_m",
+        "width_left_m", "width_middle_m", "width_right_m", "n_vehicles",
     ])
+
+    # One JSON object per frame rather than one array for the clip: a full-length
+    # run is ~200k frames, which no dashboard wants to parse as a single document.
+    json_path = os.path.join(args.output, f"clip{args.part}_{tag}.jsonl")
+    jf = open(json_path, "w")
+
+    # One entry per tracked vehicle, accumulated across every frame it appears
+    # in and written out at the end as the grouped CSV.
+    tracks = {}
 
     lane_sm = lc.Smoother(alpha=0.15, window=21, reject_rel=0.18, holdout=25)
     veh_sm = lc.Smoother(alpha=0.22, window=15, reject_rel=0.25, holdout=12)
@@ -486,7 +589,8 @@ def main():
             break
 
         if (fi - start) % args.stride == 0 or last is None:
-            last = measure_frame(frame, lane_det, veh_det, state, args)
+            last = measure_frame(frame, lane_det, veh_det, state, args,
+                                 plate_reader=plate_reader)
         r = last
 
         ego = r.get("ego")
@@ -521,9 +625,26 @@ def main():
                     if ego.missing_left and ego.right is not None:
                         lc.draw_missing(vis, lc.offset_boundary(ego.right, -p),
                                         r["gp"], p)
-            if lead is not None:
-                x1, y1, x2, y2 = [int(v) for v in lead.box]
-                cv2.rectangle(vis, (x1, y1), (x2, y2), lc.VEH_COLOR, 2)
+            for v in r["vehicles"]:
+                x1, y1, x2, y2 = [int(b) for b in v.box]
+                is_lead = lead is not None and v is lead
+                col = lc.VEH_COLOR if is_lead else lc.VEH_OTHER_COLOR
+                cv2.rectangle(vis, (x1, y1), (x2, y2), col,
+                              lc._thick(2 if is_lead else 1))
+                label = f"{x2 - x1}px"
+                if v.width is not None:
+                    label += f" {v.width:.2f}m"
+                if v.plate:
+                    label += f"  {v.plate}"
+                fs = 0.45 * lc.UI_SCALE
+                th = lc._thick(1)
+                # Dark stroke behind the glyphs: the label often lands on pale
+                # road or sky, where the box colour alone disappears.
+                for c, t in (((0, 0, 0), th + 2), (col, th)):
+                    cv2.putText(vis, label,
+                                (x1, max(lc._px(12), y1 - lc._px(5))),
+                                cv2.FONT_HERSHEY_SIMPLEX, fs, c, t,
+                                cv2.LINE_AA)
             lc.draw_readout(vis, lane_v, veh_v,
                             lc.VEHICLE_CLASSES.get(lead.cls, "Vehicle").title()
                             if lead else None,
@@ -548,7 +669,64 @@ def main():
             *([round(l.conf, 3) for l in ego.lanes] if ego else ["", "", ""]),
             *([round(l.width, 4) if l.width else "" for l in ego.lanes]
               if ego else ["", "", ""]),
+            len(r["vehicles"]),
         ])
+
+        for v in r["vehicles"]:
+            if v.track_id is None:
+                continue
+            t = tracks.get(v.track_id)
+            if t is None:
+                t = tracks[v.track_id] = {
+                    "first": fi, "last": fi, "n": 0, "cls": {},
+                    "w_px": [], "w_m": [], "w_ok": [], "z_min": None,
+                    "lead": 0, "plates": {},
+                }
+            t["last"] = fi
+            t["n"] += 1
+            t["cls"][v.cls] = t["cls"].get(v.cls, 0) + 1
+            t["w_px"].append(int(v.box[2] - v.box[0]))
+            if v.width is not None:
+                t["w_m"].append(v.width)
+                # Kept apart from w_m so the reported width comes only from
+                # where the projection holds up, while the raw spread stays
+                # visible in its own column.
+                if lc.width_is_reliable(v.Z, v.X):
+                    t["w_ok"].append(v.width)
+            if v.Z is not None:
+                t["z_min"] = v.Z if t["z_min"] is None \
+                    else min(t["z_min"], v.Z)
+            if lead is not None and v is lead:
+                t["lead"] += 1
+            if v.plate:
+                # Vote by summed confidence, not by count: three blurred
+                # agreeing misreads should not outweigh one clean read.
+                p = t["plates"].setdefault(v.plate, [0.0, 0, 0.0])
+                p[0] += v.plate_conf
+                p[1] += 1
+                p[2] = max(p[2], v.plate_conf)
+
+        jf.write(json.dumps({
+            "frame": fi,
+            "time_s": round(fi / fps, 3),
+            "lane_width_m": round(r["lane"], 4) if r["lane"] else None,
+            "lane_width_m_smooth": round(lane_v, 4) if lane_v else None,
+            "marking_missing": (ego.missing or None) if ego else None,
+            "vehicles": [{
+                "track_id": v.track_id,
+                "box": [int(b) for b in v.box],
+                "width_px": int(v.box[2] - v.box[0]),
+                "width_m": None if v.width is None else round(v.width, 4),
+                "distance_m": None if v.Z is None else round(v.Z, 2),
+                "offset_m": None if v.X is None else round(v.X, 2),
+                "width_reliable": lc.width_is_reliable(v.Z, v.X),
+                "cls": lc.VEHICLE_CLASSES.get(v.cls, "unknown"),
+                "score": round(float(v.score), 3),
+                "plate": v.plate,
+                "plate_conf": round(v.plate_conf, 3) if v.plate else None,
+                "is_lead": lead is not None and v is lead,
+            } for v in r["vehicles"]],
+        }) + "\n")
 
         fi += 1
         done = fi - start
@@ -566,8 +744,116 @@ def main():
     reader.release()
     cap.release()
     cf.close()
+    jf.close()
     if writer is not None:
         writer.release()
+
+    # A plate identifies a vehicle, so two tracks that agree on a confident
+    # plate are one vehicle the tracker lost and re-acquired. Merge them.
+    accepted = {}
+    for tid, t in tracks.items():
+        if not t["plates"]:
+            continue
+        txt, (score, votes, conf) = max(t["plates"].items(),
+                                        key=lambda kv: kv[1][0])
+        if conf >= args.plate_min_conf and votes >= args.plate_min_votes:
+            accepted.setdefault(txt, []).append(tid)
+
+    merged_into = {}
+    for txt, tids in accepted.items():
+        if len(tids) < 2:
+            continue
+        keep = min(tids)
+        for tid in tids:
+            if tid == keep:
+                continue
+            merged_into[tid] = keep
+            a, b = tracks[keep], tracks.pop(tid)
+            a["first"] = min(a["first"], b["first"])
+            a["last"] = max(a["last"], b["last"])
+            a["n"] += b["n"]
+            zs = [z for z in (a["z_min"], b["z_min"]) if z is not None]
+            a["z_min"] = min(zs) if zs else None
+            a["lead"] += b["lead"]
+            a["w_px"] += b["w_px"]
+            a["w_m"] += b["w_m"]
+            a["w_ok"] += b["w_ok"]
+            for k, v in b["cls"].items():
+                a["cls"][k] = a["cls"].get(k, 0) + v
+            for k, v in b["plates"].items():
+                p = a["plates"].setdefault(k, [0.0, 0, 0.0])
+                p[0] += v[0]
+                p[1] += v[1]
+                p[2] = max(p[2], v[2])
+    merged_from = {}
+    for src, dst in merged_into.items():
+        merged_from.setdefault(dst, []).append(src)
+
+    veh_path = os.path.join(args.output, f"clip{args.part}_{tag}_vehicles.csv")
+    with open(veh_path, "w", newline="") as vf:
+        vw = csv.writer(vf)
+        vw.writerow([
+            "track_id", "cls", "first_frame", "last_frame", "first_time_s",
+            "last_time_s", "n_frames", "plate", "plate_conf", "plate_votes",
+            "plate_candidates", "width_px_median", "width_px_max",
+            "width_m_median", "width_m_samples", "width_m_median_all",
+            "min_distance_m", "frames_as_lead", "merged_track_ids",
+        ])
+        n_short = 0
+        for tid in sorted(tracks):
+            t = tracks[tid]
+            # A track seen for a frame or two is nearly always an ID switch or
+            # a one-frame false positive. Dropped only when it carries no
+            # plate, since a plate makes even a brief sighting worth a row.
+            if t["n"] < args.min_track_frames and not t["plates"]:
+                n_short += 1
+                continue
+            cls = max(t["cls"].items(), key=lambda kv: kv[1])[0]
+            plate = conf = votes = ""
+            cands = ""
+            if t["plates"]:
+                best = max(t["plates"].items(), key=lambda kv: kv[1][0])
+                text, (score, votes, conf) = best[0], best[1]
+                # Below the gate the string is noise: a single blurred read of
+                # a plate that was never legible. It stays in the candidate
+                # list, but the plate column keeps only what is trustworthy.
+                if conf >= args.plate_min_conf and votes >= args.plate_min_votes:
+                    plate = text
+                conf = round(conf, 3)
+                # Every string that was ever read for this vehicle, so a
+                # disagreement is visible rather than silently resolved.
+                # Capped: a plate glimpsed through 20 blurred frames produces
+                # 20 one-vote misreads, which bury the reads that matter.
+                cands = "|".join(
+                    f"{txt}:{v[1]}"
+                    for txt, v in sorted(t["plates"].items(),
+                                         key=lambda kv: -kv[1][0])[:8]
+                )
+            vw.writerow([
+                tid, lc.VEHICLE_CLASSES.get(cls, "unknown"),
+                t["first"], t["last"],
+                round(t["first"] / fps, 3), round(t["last"] / fps, 3),
+                t["n"], plate, conf, votes, cands,
+                int(np.median(t["w_px"])), max(t["w_px"]),
+                round(float(np.median(t["w_ok"])), 4) if t["w_ok"] else "",
+                len(t["w_ok"]),
+                round(float(np.median(t["w_m"])), 4) if t["w_m"] else "",
+                "" if t["z_min"] is None else round(t["z_min"], 2),
+                t["lead"],
+                "|".join(str(i) for i in sorted(merged_from.get(tid, []))),
+            ])
+    n_conf = 0
+    for t in tracks.values():
+        if not t["plates"]:
+            continue
+        score, votes, conf = max(t["plates"].values(), key=lambda v: v[0])
+        if conf >= args.plate_min_conf and votes >= args.plate_min_votes:
+            n_conf += 1
+    n_width = sum(1 for t in tracks.values() if t["w_ok"])
+    print(f"\n  tracked {len(tracks)} vehicles, {n_conf} with a confident "
+          f"plate, {len(merged_into)} tracks merged by plate")
+    print(f"  {n_width} with a reliable width, {n_short} short tracks dropped "
+          f"(<{args.min_track_frames} frames, no plate)")
 
     n = max(1, fi - start)
     lanes = [float(x) for x in _col(csv_path, "lane_width_m")]
@@ -595,6 +881,8 @@ def main():
     print("\n" + "=" * 66)
     print(json.dumps(summary, indent=2))
     print(f"  csv   {csv_path}")
+    print(f"  json  {json_path}")
+    print(f"  veh   {veh_path}")
     if writer is not None:
         print(f"  video {writer.path}")
 

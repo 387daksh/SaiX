@@ -329,28 +329,147 @@ class ClrNetDetector:
 
 
 class VehicleDetector:
-    """COCO detector restricted to road vehicles."""
+    """COCO detector restricted to road vehicles, with persistent track ids."""
 
-    def __init__(self, weights, device=0, conf=0.35, imgsz=960):
+    def __init__(self, weights, device=0, conf=0.35, imgsz=960, track=True,
+                 tracker="botsort.yaml", agnostic_nms=False):
         from ultralytics import YOLO
 
         self.model = YOLO(weights)
         self.device = device
         self.conf = conf
         self.imgsz = imgsz
+        self.track = track
+        self.tracker = tracker
+        # NMS runs per class by default, so one pickup can survive as both a
+        # "truck" box and a "car" box and then pick up two track ids.
+        self.agnostic_nms = agnostic_nms
         self.keep = [2, 3, 5, 7]  # car, motorcycle, bus, truck
 
     def __call__(self, frame):
-        r = self.model.predict(
-            frame, conf=self.conf, imgsz=self.imgsz, device=self.device,
-            classes=self.keep, verbose=False,
-        )[0]
+        """Return boxes, classes, scores, track ids. Ids are None untracked."""
+        if self.track:
+            # persist=True keeps the tracker state between calls, which is what
+            # makes an id mean the same vehicle from one frame to the next.
+            r = self.model.track(
+                frame, conf=self.conf, imgsz=self.imgsz, device=self.device,
+                classes=self.keep, tracker=self.tracker, persist=True,
+                agnostic_nms=self.agnostic_nms, verbose=False,
+            )[0]
+        else:
+            r = self.model.predict(
+                frame, conf=self.conf, imgsz=self.imgsz, device=self.device,
+                classes=self.keep, agnostic_nms=self.agnostic_nms,
+                verbose=False,
+            )[0]
         if r.boxes is None or len(r.boxes) == 0:
-            return [], [], []
+            return [], [], [], []
         b = r.boxes.xyxy.cpu().numpy()
         c = r.boxes.cls.cpu().numpy().astype(int)
         s = r.boxes.conf.cpu().numpy()
-        return b, c, s
+        # A tracked box has no id on the frame it appears, before the tracker
+        # has confirmed it, so the column can be missing or hold gaps.
+        if r.boxes.id is None:
+            ids = [None] * len(b)
+        else:
+            ids = [int(i) for i in r.boxes.id.cpu().numpy()]
+        return b, c, s, ids
+
+
+class PlateReader:
+    """License plate detection plus OCR, matched back to vehicle boxes.
+
+    Wraps fast-alpr (MIT): a YOLOv9-t plate detector followed by a CCT OCR
+    model, both ONNX.
+
+    Two modes. Whole-frame detection is one inference per frame, but the
+    detector runs at 384 px, so a plate 30 px wide in a 1920-wide frame is
+    6 px by the time it is seen and nothing is read. read_crops() instead runs
+    the detector per vehicle box at near-native resolution: slower per frame,
+    but on a 700-frame sample it found 32 plates against 4 for whole-frame at
+    the same size, which is why it is the default. Either way containment
+    decides which vehicle a plate belongs to.
+    """
+
+    def __init__(self, detector="yolo-v9-t-384-license-plate-end2end",
+                 ocr="cct-xs-v2-global-model", conf=0.4, device=0):
+        from fast_alpr import ALPR
+
+        # Pin CUDA. The default list leads with TensorRT, and when its DLL
+        # fails to load onnxruntime falls back to CPU rather than to CUDA.
+        #
+        # This asks for CUDA but cannot supply it: onnxruntime-gpu builds
+        # against CUDA 12 and will fall back to CPU when only CUDA 13 is
+        # installed (torch 2.12+cu132 ships cublasLt64_13.dll, not _12). The
+        # fallback is silent apart from a stderr warning, so check the log for
+        # "Failed to create CUDAExecutionProvider" before blaming throughput
+        # on the GPU.
+        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                     if device != "cpu" else ["CPUExecutionProvider"])
+        self.alpr = ALPR(detector_model=detector, ocr_model=ocr,
+                         detector_conf_thresh=conf,
+                         detector_providers=providers, ocr_providers=providers)
+
+    def __call__(self, frame, origin=(0, 0)):
+        """Return [(text, conf, (x1, y1, x2, y2)), ...] for the frame.
+
+        origin offsets the boxes back into the full frame when the caller
+        passed a crop rather than the whole image.
+        """
+        ox, oy = origin
+        out = []
+        for r in self.alpr.predict(frame):
+            if r.ocr is None or not r.ocr.text:
+                continue
+            cs = r.ocr.confidence
+            # Per-character confidences: the weakest character decides whether
+            # the whole string can be trusted.
+            conf = float(min(cs)) if isinstance(cs, (list, tuple)) else float(cs)
+            b = r.detection.bounding_box
+            out.append((r.ocr.text, conf,
+                        (b.x1 + ox, b.y1 + oy, b.x2 + ox, b.y2 + oy)))
+        return out
+
+    def read_crops(self, frame, vehicles, min_px=100, pad=8):
+        """Run the plate detector on each vehicle box instead of the frame.
+
+        The detector takes a fixed 384px input, so a full 1080p frame is
+        downscaled 2.8x before it looks for a plate that was only ~60px wide
+        to begin with. Feeding it one vehicle at a time keeps the plate close
+        to native resolution, at the cost of one inference per vehicle.
+        """
+        h, w = frame.shape[:2]
+        out = []
+        for v in vehicles:
+            x1, y1, x2, y2 = (int(c) for c in v.box)
+            if x2 - x1 < min_px:
+                continue
+            x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+            x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size:
+                out.extend(self(crop, origin=(x1, y1)))
+        return out
+
+
+def attach_plates(vehicles, plates):
+    """Give each plate to the smallest vehicle box that contains its centre.
+
+    Smallest wins because a motorcycle in front of a truck sits inside the
+    truck's box too, and the tighter box is the real owner.
+    """
+    for text, conf, (px1, py1, px2, py2) in plates:
+        cx, cy = 0.5 * (px1 + px2), 0.5 * (py1 + py2)
+        best, best_area = None, None
+        for v in vehicles:
+            x1, y1, x2, y2 = v.box
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue
+            area = (x2 - x1) * (y2 - y1)
+            if best_area is None or area < best_area:
+                best, best_area = v, area
+        if best is not None and conf > best.plate_conf:
+            best.plate, best.plate_conf = text, conf
 
 
 def build_lane_detector(kind, args):

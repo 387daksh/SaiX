@@ -649,26 +649,65 @@ def scale_from_lane_width(raw_widths, target_m, base_height=1.0):
 # ---------------------------------------------------------------------------
 
 class Vehicle:
-    __slots__ = ("box", "cls", "score", "X", "Z", "width")
+    __slots__ = ("box", "cls", "score", "X", "Z", "width", "track_id",
+                 "plate", "plate_conf")
 
-    def __init__(self, box, cls, score, X, Z, width):
+    def __init__(self, box, cls, score, X, Z, width, track_id=None):
         self.box = box
         self.cls = cls
         self.score = score
         self.X = X
         self.Z = Z
         self.width = width
+        self.track_id = track_id
+        # Filled in by the plate reader once it knows which box a plate sits in.
+        self.plate = None
+        self.plate_conf = 0.0
 
 
-def measure_vehicles(boxes, classes, scores, gp, z_max=90.0):
+# Where a box-bottom width measurement can be trusted, in metres. Closer than
+# Z_LO the box spans the side of an obliquely seen vehicle rather than its
+# front; past Z_HI the box is so few pixels tall that a pixel of slop at the
+# tyre line swings Z by several metres. Beyond X_MAX the vehicle is oncoming
+# or in a far lane and is again seen side-on.
+#
+# Tuned on this footage by trading coverage against the share of per-track
+# widths that come out physically impossible: this band keeps 246 of 655
+# tracks at 15% impossible, against 504 at 22% unfiltered. Tightening to
+# 10-30 m and 3 m cuts that to 13% but keeps only 76 tracks, which is not
+# worth losing two thirds of the vehicles for. Accuracy is flat across every
+# band tried -- a car reads about 1.6 m against a true 1.75 -- so the band
+# removes the catastrophic tail, not the residual bias.
+WIDTH_OK_Z = (8.0, 40.0)
+WIDTH_OK_X = 6.0
+
+
+def width_is_reliable(Z, X):
+    """Whether a box-bottom width at this position is worth reporting."""
+    if Z is None or X is None:
+        return False
+    return WIDTH_OK_Z[0] <= Z <= WIDTH_OK_Z[1] and abs(X) <= WIDTH_OK_X
+
+
+def measure_vehicles(boxes, classes, scores, gp, z_max=90.0, track_ids=None):
     """
     Width of each vehicle from its box's bottom edge.
 
     The bottom edge sits where the tyres meet the road, so both of its corners
     lie on the road plane and project to true metric positions.
+
+    With gp None there is no road plane and nothing can be placed in metres.
+    The boxes still come back, carrying no metric fields, because plate reading
+    and track identity need no geometry -- and long stretches of dashcam
+    footage have no lane markings to build a ground plane from.
     """
     out = []
-    for (x1, y1, x2, y2), c, s in zip(boxes, classes, scores):
+    if track_ids is None:
+        track_ids = [None] * len(boxes)
+    for (x1, y1, x2, y2), c, s, tid in zip(boxes, classes, scores, track_ids):
+        if gp is None:
+            out.append(Vehicle((x1, y1, x2, y2), c, s, None, None, None, tid))
+            continue
         X, Z = gp.to_ground(np.array([x1, x2]), np.array([y2, y2]))
         if not np.all(np.isfinite(X)) or not np.all(np.isfinite(Z)):
             continue
@@ -677,7 +716,7 @@ def measure_vehicles(boxes, classes, scores, gp, z_max=90.0):
             continue
         w = float(abs(X[1] - X[0]))
         out.append(
-            Vehicle((x1, y1, x2, y2), c, s, float(np.mean(X)), z, w)
+            Vehicle((x1, y1, x2, y2), c, s, float(np.mean(X)), z, w, tid)
         )
     return out
 
@@ -774,8 +813,22 @@ class Smoother:
 
 LANE_COLOR = (90, 230, 90)
 VEH_COLOR = (80, 190, 255)
+VEH_OTHER_COLOR = (40, 150, 255)
 MISSING_COLOR = (70, 70, 245)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# Overlay text and panel geometry were sized for a screen; the numbers are
+# unreadable when the 1080p render is watched scaled down, so every font size
+# and pixel offset in the readout is multiplied by this.
+UI_SCALE = 1.6
+
+
+def _px(v):
+    return int(round(v * UI_SCALE))
+
+
+def _thick(v):
+    return max(1, int(round(v * UI_SCALE)))
 
 
 def draw_missing(img, b, gp, pitch, color=MISSING_COLOR, z_lo=4.0, z_hi=40.0):
@@ -834,22 +887,24 @@ def draw_confidence(img, lanes, x0, y0, w=300):
     scheme would collapse. The number is always present, so colour is never
     carrying the value on its own.
     """
-    lh = 26
-    bx = x0 + 74
-    bw = w - 108
-    cv2.putText(img, "Lane marking confidence", (x0, y0 - 9), _FONT, 0.45,
-                (150, 160, 170), 1, cv2.LINE_AA)
+    lh = _px(26)
+    bx = x0 + _px(74)
+    bw = w - _px(108)
+    cv2.putText(img, "Lane marking confidence", (x0, y0 - _px(9)), _FONT,
+                0.45 * UI_SCALE, (150, 160, 170), _thick(1), cv2.LINE_AA)
     for i, ln in enumerate(lanes):
         y = y0 + i * lh
-        cv2.putText(img, ln.name.title(), (x0, y + 11), _FONT, 0.46,
-                    (170, 180, 190), 1, cv2.LINE_AA)
-        cv2.rectangle(img, (bx, y + 2), (bx + bw, y + 12), (58, 58, 58), -1)
+        cv2.putText(img, ln.name.title(), (x0, y + _px(11)), _FONT,
+                    0.46 * UI_SCALE, (170, 180, 190), _thick(1), cv2.LINE_AA)
+        cv2.rectangle(img, (bx, y + _px(2)), (bx + bw, y + _px(12)),
+                      (58, 58, 58), -1)
         fill = int(bw * float(np.clip(ln.conf, 0.0, 1.0)))
         if fill > 1:
-            cv2.rectangle(img, (bx, y + 2), (bx + fill, y + 12),
+            cv2.rectangle(img, (bx, y + _px(2)), (bx + fill, y + _px(12)),
                           LANE_COLOR, -1)
-        cv2.putText(img, f"{ln.conf:.2f}", (bx + bw + 10, y + 12), _FONT,
-                    0.5, (235, 238, 242), 1, cv2.LINE_AA)
+        cv2.putText(img, f"{ln.conf:.2f}", (bx + bw + _px(10), y + _px(12)),
+                    _FONT, 0.5 * UI_SCALE, (235, 238, 242), _thick(1),
+                    cv2.LINE_AA)
 
 
 def draw_readout(img, lane_m, veh_m, veh_label, missing="", lanes=None):
@@ -861,10 +916,11 @@ def draw_readout(img, lane_m, veh_m, veh_label, missing="", lanes=None):
     ]
     if missing:
         lines.append(("Marking missing", missing.upper()))
-    pad, lh = 14, 42
+    pad, lh = _px(14), _px(42)
     n_conf = len(lanes) if lanes else 0
-    bw = 366
-    bh = pad * 2 + lh * len(lines) + (26 * n_conf + 40 if n_conf else 0)
+    bw = _px(366)
+    bh = pad * 2 + lh * len(lines) + (_px(26) * n_conf + _px(40)
+                                      if n_conf else 0)
     x0, y0 = 26, 26
 
     panel = img[y0:y0 + bh, x0:x0 + bw]
@@ -874,16 +930,17 @@ def draw_readout(img, lane_m, veh_m, veh_label, missing="", lanes=None):
         img[y0:y0 + bh, x0:x0 + bw] = panel
 
     for i, (k, val) in enumerate(lines):
-        y = y0 + pad + lh * i + 28
+        y = y0 + pad + lh * i + _px(28)
         col = MISSING_COLOR if k == "Marking missing" else (255, 255, 255)
-        cv2.putText(img, k, (x0 + 16, y), _FONT, 0.6, (165, 175, 185), 1,
-                    cv2.LINE_AA)
-        cv2.putText(img, val, (x0 + 180, y), _FONT, 0.84, col, 2,
-                    cv2.LINE_AA)
+        cv2.putText(img, k, (x0 + _px(16), y), _FONT, 0.6 * UI_SCALE,
+                    (165, 175, 185), _thick(1), cv2.LINE_AA)
+        cv2.putText(img, val, (x0 + _px(180), y), _FONT, 0.84 * UI_SCALE, col,
+                    _thick(2), cv2.LINE_AA)
 
     if lanes:
-        draw_confidence(img, lanes, x0 + 16,
-                        y0 + pad + lh * len(lines) + 30, w=bw - 32)
+        draw_confidence(img, lanes, x0 + _px(16),
+                        y0 + pad + lh * len(lines) + _px(30),
+                        w=bw - _px(32))
 
 
 # ---------------------------------------------------------------------------
